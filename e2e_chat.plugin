@@ -1,0 +1,655 @@
+import base64
+import os
+import random
+import re
+import traceback
+from typing import Any, Optional, List
+
+from base_plugin import BasePlugin, HookResult, HookStrategy, MenuItemData, MenuItemType, MethodHook
+from ui.bulletin import BulletinHelper
+from ui.settings import Header, Divider, Switch
+
+from client_utils import get_last_fragment
+from hook_utils import get_private_field
+from android_utils import run_on_ui_thread, OnClickListener
+from android.widget import ImageView, LinearLayout
+from javax.crypto import Cipher, SecretKeyFactory
+from javax.crypto.spec import SecretKeySpec, GCMParameterSpec, PBEKeySpec
+from java.lang import String
+from org.telegram.ui import ChatActivity
+from org.telegram.messenger import SendMessagesHelper, AndroidUtilities, R
+from org.telegram.ui.ActionBar import Theme
+
+__id__ = "e2e_chat"
+__name__ = "E2E Cipher"
+__description__ = "Инфобез-плагин: шифрует сообщения в чатах по набору ключей и снижает риск утечки содержимого."
+__author__ = "@sonrayy"
+__version__ = "1.2.0"
+__icon__ = "exteraPlugins/1"
+__min_version__ = "11.9.1"
+
+PREFIX = "e2e1:"
+GCM_IV_LEN = 12
+GCM_TAG_BITS = 128
+CIPHER_TRANSFORM = "AES/GCM/NoPadding"
+KEYS_REQUIRED = 5
+KEY_SEPARATOR = "|"
+PBKDF2_ITERATIONS = 100000
+PBKDF2_SALT_LEN = 16
+
+class ChatActivityHook(MethodHook):
+    def __init__(self, plugin: "E2EChatPlugin"):
+        super().__init__()
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        run_on_ui_thread(lambda: self.plugin.setup_ui(param.thisObject), 300)
+
+class E2EChatPlugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self._sending = False
+        self._btns = {}
+        self._chat_ui_unhook = None
+
+    def create_settings(self):
+        return [
+            Header(text="E2E — настройки"),
+            Switch(
+                key="epstein_mode",
+                text="Режим Эпштейна",
+                subtext="Теги и @упоминания остаются видимыми при шифровании",
+                default=False
+            ),
+            Divider(text="Команды: .e2e keys <5 ключей> | .e2e on/off | .e2e status | .e2e clear | .e2e dec")
+        ]
+
+    def on_plugin_load(self):
+        self.add_on_send_message_hook()
+        self.add_menu_item(MenuItemData(
+            menu_type=MenuItemType.MESSAGE_CONTEXT_MENU,
+            text="E2E: Расшифровать",
+            on_click=self.handle_message_decrypt,
+            icon="menu_unlock"
+        ))
+        self.add_menu_item(MenuItemData(
+            menu_type=MenuItemType.CHAT_ACTION_MENU,
+            text="E2E: Шифрование",
+            on_click=self.handle_encryption_toggle,
+            icon="msg_lock"
+        ))
+        self.add_menu_item(MenuItemData(
+            menu_type=MenuItemType.CHAT_ACTION_MENU,
+            text="E2E: Расшифровать чат",
+            on_click=self.handle_chat_decrypt,
+            icon="menu_unlock"
+        ))
+        self._install_chat_ui_hook()
+
+    def on_plugin_unload(self):
+        self._remove_chat_ui_hook()
+
+    def _install_chat_ui_hook(self):
+        if self._chat_ui_unhook is not None:
+            return
+        try:
+            method = ChatActivity.getClass().getDeclaredMethod("onResume")
+            self._chat_ui_unhook = self.hook_method(method, ChatActivityHook(self))
+        except Exception:
+            self._chat_ui_unhook = None
+
+    def _remove_chat_ui_hook(self):
+        if self._chat_ui_unhook is None:
+            return
+        try:
+            self.unhook_method(self._chat_ui_unhook)
+        except Exception:
+            pass
+        self._chat_ui_unhook = None
+
+    def setup_ui(self, act):
+        if not (v := act.getChatActivityEnterView()) or not (layout := get_private_field(v, "attachLayout")):
+            return
+        cid = 0
+        try:
+            cid = int(act.getDialogId())
+        except Exception:
+            cid = 0
+        btn = v.findViewWithTag("e2e_btn")
+        if not btn:
+            btn = ImageView(v.getContext())
+            btn.setTag("e2e_btn")
+            btn.setImageResource(R.drawable.msg_lock)
+            btn.setPadding(AndroidUtilities.dp(12), 0, AndroidUtilities.dp(12), 0)
+            btn.setBackground(Theme.createSelectorDrawable(Theme.getColor(Theme.key_listSelector), 1))
+            btn.setOnClickListener(OnClickListener(lambda _: self._toggle(cid)))
+            layout.addView(btn, 0, LinearLayout.LayoutParams(AndroidUtilities.dp(48), AndroidUtilities.dp(48)))
+        self._btns[cid] = btn
+        self._refresh_btn(cid)
+
+    def _toggle(self, dialog_id: int):
+        if dialog_id == 0:
+            BulletinHelper.show_error("E2E: не удалось определить чат.")
+            return
+        enabled = self._get_enabled(dialog_id)
+        if not enabled:
+            keys = self._get_keys(dialog_id)
+            if len(keys) < KEYS_REQUIRED:
+                BulletinHelper.show_error("E2E: сначала установи 5 ключей: .e2e keys <5 ключей>")
+                return
+        self._set_enabled(dialog_id, not enabled)
+        self._refresh_btn(dialog_id)
+        BulletinHelper.show_success("E2E: шифрование включено." if not enabled else "E2E: шифрование выключено.")
+
+    def _refresh_btn(self, dialog_id: int):
+        btn = self._btns.get(dialog_id)
+        if not btn:
+            return
+        enabled = self._get_enabled(dialog_id)
+        color = Theme.getColor(Theme.key_chat_messagePanelSend if enabled else Theme.key_chat_messagePanelIcons)
+        btn.setColorFilter(color)
+
+    def on_send_message_hook(self, account: int, params: Any) -> HookResult:
+        if self._sending:
+            return HookResult()
+        if not isinstance(getattr(params, "message", None), str):
+            return HookResult()
+
+        text = params.message.strip()
+        if text.startswith(".e2e"):
+            return self._handle_e2e_command(params)
+
+        dialog_id = self._get_dialog_id_from_params(params)
+        if dialog_id == 0:
+            return HookResult()
+
+        if not self._get_enabled(dialog_id):
+            return HookResult()
+
+        keys = self._get_keys(dialog_id)
+        if not keys:
+            BulletinHelper.show_error("E2E: ключи не установлены или устарели. Задай заново: .e2e keys <5 ключей>")
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        if text.startswith(PREFIX):
+            return HookResult()
+        if len(keys) < KEYS_REQUIRED:
+            BulletinHelper.show_error("E2E: нужно 5 ключей для шифрования.")
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        self._execute_send(account, params, params.message)
+        return HookResult(strategy=HookStrategy.CANCEL)
+
+    def _handle_e2e_command(self, params: Any) -> HookResult:
+        text = params.message.strip()
+        parts = text.split(" ", 2)
+        if len(parts) == 1 or parts[1].lower() in {"help", "h"}:
+            self._show_help()
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        dialog_id = self._get_dialog_id_from_params(params)
+        if dialog_id == 0:
+            BulletinHelper.show_error("E2E: не удалось определить чат.")
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        action = parts[1].lower()
+        payload = parts[2].strip() if len(parts) > 2 else ""
+        if action in {"key", "keys"}:
+            if not payload:
+                BulletinHelper.show_error("Использование: .e2e keys <5 ключей>")
+                return HookResult(strategy=HookStrategy.CANCEL)
+
+            key_words = self._parse_key_words(payload)
+            if action == "key" and len(key_words) == 1:
+                key_hashes = [self._hash_key(key_words[0])]
+                key_hashes = [k for k in key_hashes if k]
+                if not key_hashes:
+                    BulletinHelper.show_error("E2E: не удалось сохранить ключ.")
+                    return HookResult(strategy=HookStrategy.CANCEL)
+                self._set_keys(dialog_id, key_hashes)
+                BulletinHelper.show_success("E2E: ключ сохранен для этого чата.")
+                return HookResult(strategy=HookStrategy.CANCEL)
+
+            if len(key_words) != KEYS_REQUIRED:
+                BulletinHelper.show_error("E2E: нужно ровно 5 ключей.")
+                return HookResult(strategy=HookStrategy.CANCEL)
+
+            if len(set(key_words)) != len(key_words):
+                BulletinHelper.show_error("E2E: ключи должны быть разными.")
+                return HookResult(strategy=HookStrategy.CANCEL)
+
+            key_hashes = [self._hash_key(word) for word in key_words]
+            key_hashes = [k for k in key_hashes if k]
+            if len(key_hashes) != KEYS_REQUIRED:
+                BulletinHelper.show_error("E2E: не удалось сохранить ключи.")
+                return HookResult(strategy=HookStrategy.CANCEL)
+            self._set_keys(dialog_id, key_hashes)
+            BulletinHelper.show_success("E2E: ключи сохранены для этого чата.")
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        if action == "on":
+            keys = self._get_keys(dialog_id)
+            if len(keys) < KEYS_REQUIRED:
+                BulletinHelper.show_error("E2E: сначала установи 5 ключей: .e2e keys <5 ключей>")
+                return HookResult(strategy=HookStrategy.CANCEL)
+
+            self._set_enabled(dialog_id, True)
+            self._refresh_btn(dialog_id)
+            BulletinHelper.show_success("E2E: шифрование включено.")
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        if action == "off":
+            self._set_enabled(dialog_id, False)
+            self._refresh_btn(dialog_id)
+            BulletinHelper.show_success("E2E: шифрование выключено.")
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        if action == "status":
+            enabled = self._get_enabled(dialog_id)
+            keys_count = len(self._get_keys(dialog_id))
+            status = "вкл" if enabled else "выкл"
+            key_status = f"{keys_count}/{KEYS_REQUIRED}"
+            BulletinHelper.show_info(f"E2E: статус — {status}, ключи — {key_status}.")
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        if action in {"selftest", "test"}:
+            test_key = self._hash_key("e2e_selftest_key")
+            test_plain = "e2e selftest ok"
+            enc = self._encrypt(test_key, test_plain)
+            dec = self._decrypt(test_key, enc) if enc else None
+            if dec == test_plain:
+                BulletinHelper.show_success("E2E: selftest OK (GCM + PBKDF2).")
+            else:
+                BulletinHelper.show_error("E2E: selftest failed.")
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        if action in {"dec", "decrypt"}:
+            reply = getattr(params, "replyToMsg", None)
+            if reply is None:
+                BulletinHelper.show_error("E2E: ответь на зашифрованное сообщение для расшифровки.")
+                return HookResult(strategy=HookStrategy.CANCEL)
+
+            key_hashes = self._get_keys(dialog_id)
+            if not key_hashes:
+                BulletinHelper.show_error("E2E: сначала установи ключи: .e2e keys <5 ключей>")
+                return HookResult(strategy=HookStrategy.CANCEL)
+
+            if self._decrypt_message_object(reply, key_hashes) is not None:
+                self._refresh_current_chat()
+                BulletinHelper.show_success("E2E: сообщение расшифровано.")
+            else:
+                BulletinHelper.show_info("E2E: зашифрованное сообщение не найдено.")
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        if action == "clear":
+            self._set_keys(dialog_id, [])
+            self._set_enabled(dialog_id, False)
+            self._refresh_btn(dialog_id)
+            BulletinHelper.show_success("E2E: ключи удалены, шифрование выключено.")
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        self._show_help()
+        return HookResult(strategy=HookStrategy.CANCEL)
+
+    @staticmethod
+    def _hash_key(key: str) -> str:
+        try:
+            salt = os.urandom(PBKDF2_SALT_LEN)
+            chars = String(key).toCharArray()
+            spec = PBEKeySpec(chars, salt, PBKDF2_ITERATIONS, 256)
+            factory = SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256")
+            derived = bytes(factory.generateSecret(spec).getEncoded())
+            salt_b64 = base64.b64encode(salt).decode("ascii")
+            dk_b64 = base64.b64encode(derived).decode("ascii")
+            return f"pbkdf2${PBKDF2_ITERATIONS}${salt_b64}${dk_b64}"
+        except Exception:
+            return ""
+
+    def _get_key_bytes(self, key_hash_or_plain: str) -> Optional[bytes]:
+        key_hash_or_plain = key_hash_or_plain.strip()
+        if not key_hash_or_plain:
+            return None
+        if not key_hash_or_plain.startswith("pbkdf2$"):
+            return None
+        parts = key_hash_or_plain.split("$")
+        if len(parts) != 4:
+            return None
+        dk_b64 = parts[3]
+        try:
+            return base64.b64decode(dk_b64)
+        except Exception:
+            return None
+
+    def _encrypt(self, key_hash: str, plaintext: str) -> Optional[str]:
+        try:
+            key_bytes = self._get_key_bytes(key_hash)
+            if not key_bytes:
+                return None
+            iv = os.urandom(GCM_IV_LEN)
+            cipher = Cipher.getInstance(CIPHER_TRANSFORM)
+            cipher.init(Cipher.ENCRYPT_MODE, SecretKeySpec(key_bytes, "AES"), GCMParameterSpec(GCM_TAG_BITS, iv))
+            encrypted = bytes(cipher.doFinal(plaintext.encode("utf-8")))
+            payload = iv + encrypted
+            return base64.b64encode(payload).decode("ascii")
+        except Exception:
+            self.log(f"{__name__} _encrypt error:\n{traceback.format_exc()}")
+            return None
+
+    def _decrypt(self, key_hash: str, payload_b64: str) -> Optional[str]:
+        try:
+            raw = base64.b64decode(payload_b64)
+            if len(raw) <= GCM_IV_LEN:
+                return None
+            iv = raw[:GCM_IV_LEN]
+            encrypted = raw[GCM_IV_LEN:]
+            key_bytes = self._get_key_bytes(key_hash)
+            if not key_bytes:
+                return None
+            cipher = Cipher.getInstance(CIPHER_TRANSFORM)
+            cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key_bytes, "AES"), GCMParameterSpec(GCM_TAG_BITS, iv))
+            decrypted = bytes(cipher.doFinal(encrypted))
+            return decrypted.decode("utf-8")
+        except Exception:
+            self.log(f"{__name__} _decrypt error:\n{traceback.format_exc()}")
+            return None
+
+    @staticmethod
+    def _extract_payload(text: str) -> Optional[str]:
+        if not text.startswith(PREFIX):
+            return None
+        payload = text[len(PREFIX):]
+        if not payload:
+            return None
+        return payload.split(None, 1)[0] or None
+
+    def _get_epstein_tags(self, text: str) -> str:
+        if not self.get_setting("epstein_mode", False):
+            return ""
+        tags = re.findall(r"([#@][\w]+)", text)
+        return " ".join(tags)
+
+
+    def _execute_send(self, account: int, params: Any, secret: str) -> None:
+        if not secret:
+            return
+        self._sending = True
+        try:
+            dialog_id = self._get_dialog_id_from_params(params)
+            if dialog_id == 0:
+                BulletinHelper.show_error("E2E: не удалось определить чат.")
+                return
+            keys = self._get_keys(dialog_id)
+            if len(keys) < KEYS_REQUIRED:
+                BulletinHelper.show_error("E2E: нужно 5 ключей для шифрования.")
+                return
+            keys = [k for k in keys if self._get_key_bytes(k)]
+            if len(keys) < KEYS_REQUIRED:
+                BulletinHelper.show_error("E2E: ключи устарели. Задай заново: .e2e keys <5 ключей>")
+                return
+
+            key_hash = self._choose_key_hash(keys)
+            encrypted_payload = self._encrypt(key_hash, secret)
+            if not encrypted_payload:
+                BulletinHelper.show_error("E2E: не удалось зашифровать сообщение.")
+                return
+
+            tags = self._get_epstein_tags(secret)
+            final_msg = PREFIX + encrypted_payload
+            if tags:
+                final_msg = f"{final_msg} {tags}"
+
+            reply_to = getattr(params, "replyToMsg", None)
+            reply_to_top = getattr(params, "replyToTopMsg", None)
+            story_item = getattr(params, "replyToStoryItem", None)
+            reply_quote = getattr(params, "replyQuote", None)
+
+            req = SendMessagesHelper.SendMessageParams.of(
+                final_msg,
+                params.peer,
+                reply_to,
+                reply_to_top,
+                None,
+                False,
+                None,
+                None,
+                None,
+                True,
+                0,
+                0,
+                None,
+                False
+            )
+            if story_item:
+                req.replyToStoryItem = story_item
+            if reply_quote:
+                req.replyQuote = reply_quote
+
+            SendMessagesHelper.getInstance(account).sendMessage(req)
+        finally:
+            self._sending = False
+
+    def _get_dialog_id_from_params(self, params: Any) -> int:
+        return int(getattr(params, "peer", 0))
+
+    @staticmethod
+    def _key_setting(dialog_id: int) -> str:
+        return f"e2e_key_{dialog_id}"
+
+    @staticmethod
+    def _serialize_keys(key_hashes: List[str]) -> str:
+        return KEY_SEPARATOR.join(key_hashes)
+
+    @staticmethod
+    def _deserialize_keys(raw: str) -> List[str]:
+        if not raw:
+            return []
+        return [item for item in raw.split(KEY_SEPARATOR) if item]
+
+    @staticmethod
+    def _enabled_setting(dialog_id: int) -> str:
+        return f"e2e_enabled_{dialog_id}"
+
+    def _get_keys(self, dialog_id: int) -> List[str]:
+        raw = self.get_setting(self._key_setting(dialog_id), "")
+        keys = self._deserialize_keys(raw)
+        return [k for k in keys if k.startswith("pbkdf2$")]
+
+    def _set_keys(self, dialog_id: int, key_hashes: List[str]) -> None:
+        self.set_setting(self._key_setting(dialog_id), self._serialize_keys(key_hashes))
+
+    def _get_enabled(self, dialog_id: int) -> bool:
+        return bool(self.get_setting(self._enabled_setting(dialog_id), False))
+
+    def _set_enabled(self, dialog_id: int, enabled: bool) -> None:
+        self.set_setting(self._enabled_setting(dialog_id), enabled)
+
+    @staticmethod
+    def _show_help():
+        BulletinHelper.show_info(
+            "Команды E2E:\n"
+            ".e2e keys <5 ключей>\n"
+            ".e2e on / .e2e off\n"
+            ".e2e status\n"
+            ".e2e selftest\n"
+            ".e2e dec (в ответ на сообщение)\n"
+            ".e2e clear"
+        )
+
+    def handle_message_decrypt(self, context):
+        message_object = context.get("message") if context else None
+        if not message_object:
+            BulletinHelper.show_error("E2E: не удалось получить сообщение.")
+            return
+
+        message = getattr(message_object, "messageOwner", None)
+        text = getattr(message, "message", None)
+        if not isinstance(text, str) or not self._extract_payload(text):
+            BulletinHelper.show_info("E2E: это сообщение не зашифровано.")
+            return
+
+        dialog_id = 0
+        try:
+            dialog_id = int(message_object.getDialogId())
+        except Exception:
+            dialog_id = int(getattr(message, "dialog_id", 0) or 0)
+
+        if dialog_id == 0:
+            BulletinHelper.show_error("E2E: не удалось определить чат.")
+            return
+
+        key_hashes = self._get_keys(dialog_id)
+        if not key_hashes:
+            BulletinHelper.show_error("E2E: сначала установи ключи: .e2e keys <5 ключей>")
+            return
+
+        if self._decrypt_message_object(message_object, key_hashes) is not None:
+            self._refresh_current_chat()
+            BulletinHelper.show_success("E2E: сообщение расшифровано.")
+        else:
+            BulletinHelper.show_info("E2E: не удалось расшифровать сообщение.")
+
+    def handle_encryption_toggle(self, context):
+        dialog_id = self._get_current_dialog_id()
+        if dialog_id == 0:
+            BulletinHelper.show_error("E2E: не удалось определить чат.")
+            return
+
+        key_hashes = self._get_keys(dialog_id)
+        if not self._get_enabled(dialog_id) and len(key_hashes) < KEYS_REQUIRED:
+            BulletinHelper.show_error("E2E: сначала установи 5 ключей: .e2e keys <5 ключей>")
+            return
+
+        enabled = self._get_enabled(dialog_id)
+        self._set_enabled(dialog_id, not enabled)
+        self._refresh_btn(dialog_id)
+        if enabled:
+            BulletinHelper.show_success("E2E: шифрование выключено.")
+        else:
+            BulletinHelper.show_success("E2E: шифрование включено.")
+
+    def handle_chat_decrypt(self, context):
+        dialog_id = self._get_current_dialog_id()
+        if dialog_id == 0:
+            BulletinHelper.show_error("E2E: не удалось определить чат.")
+            return
+
+        key_hashes = self._get_keys(dialog_id)
+        if not key_hashes:
+            BulletinHelper.show_error("E2E: сначала установи ключи: .e2e keys <5 ключей>")
+            return
+
+        decrypted_count = self._decrypt_chat_messages(key_hashes, show_errors=True)
+        if decrypted_count is None:
+            return
+        if decrypted_count > 0:
+            self._refresh_current_chat()
+            BulletinHelper.show_success(f"E2E: расшифровано сообщений — {decrypted_count}.")
+        else:
+            BulletinHelper.show_info("E2E: зашифрованных сообщений не найдено.")
+
+    def _get_current_dialog_id(self) -> int:
+        fragment = get_last_fragment()
+        if fragment is None:
+            return 0
+        try:
+            return int(fragment.getDialogId())
+        except Exception:
+            return 0
+
+    def _decrypt_message_object(
+        self,
+        message_object: Any,
+        key_hashes: List[str],
+    ) -> Optional[str]:
+        message = getattr(message_object, "messageOwner", None)
+        if message is None:
+            return None
+
+        text = getattr(message, "message", None)
+        if not isinstance(text, str):
+            return None
+
+        payload = self._extract_payload(text)
+        if not payload:
+            return None
+        decrypted = self._decrypt_with_keys(key_hashes, payload)
+        if decrypted is None:
+            return None
+
+        message.message = decrypted
+        try:
+            message_object.applyNewText(decrypted)
+        except Exception:
+            message_object.applyNewText()
+        return decrypted
+
+    def _decrypt_with_keys(self, key_hashes: List[str], payload_b64: str) -> Optional[str]:
+        result = None
+        for key_hash in key_hashes:
+            decrypted = self._decrypt(key_hash, payload_b64)
+            if decrypted is not None and result is None:
+                result = decrypted
+        return result
+
+    def _decrypt_chat_messages(
+        self,
+        key_hashes: List[str],
+        show_errors: bool = False,
+    ) -> Optional[int]:
+        fragment = get_last_fragment()
+        if not isinstance(fragment, ChatActivity):
+            if show_errors:
+                BulletinHelper.show_error("E2E: не удалось получить чат.")
+            return None
+
+        chat_adapter = get_private_field(fragment, "chatAdapter")
+        if chat_adapter is None:
+            if show_errors:
+                BulletinHelper.show_error("E2E: не удалось получить список сообщений.")
+            return None
+
+        try:
+            messages = chat_adapter.getMessages()
+        except Exception:
+            if show_errors:
+                BulletinHelper.show_error("E2E: не удалось получить сообщения.")
+            return None
+
+        decrypted_count = 0
+        try:
+            for i in range(messages.size()):
+                message_object = messages.get(i)
+                if self._decrypt_message_object(message_object, key_hashes) is not None:
+                    decrypted_count += 1
+        except Exception:
+            self.log(f"{__name__} decrypt chat error:\n{traceback.format_exc()}")
+            if show_errors:
+                BulletinHelper.show_error("E2E: ошибка при расшифровке чата.")
+            return None
+
+        return decrypted_count
+
+    @staticmethod
+    def _parse_key_words(payload: str) -> List[str]:
+        cleaned = payload.replace(",", " ").strip()
+        return [word for word in cleaned.split() if word]
+
+    @staticmethod
+    def _choose_key_hash(key_hashes: List[str]) -> str:
+        return random.SystemRandom().choice(key_hashes)
+
+    def _refresh_current_chat(self):
+        try:
+            fragment = get_last_fragment()
+            if fragment is None:
+                return
+            if isinstance(fragment, ChatActivity):
+                chat_list_view = fragment.getChatListView()
+                if chat_list_view and chat_list_view.getAdapter():
+                    chat_list_view.getAdapter().notifyDataSetChanged()
+                    return
+            method = fragment.getClass().getDeclaredMethod("updateVisibleRows")
+            method.setAccessible(True)
+            method.invoke(fragment)
+        except Exception:
+            pass

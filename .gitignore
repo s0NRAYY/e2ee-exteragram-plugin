@@ -1,0 +1,8 @@
+# Source folders
+Plugins/
+SDK/
+TelegramSource/
+exteraDocs/
+
+# macOS
+.DS_Store
